@@ -1,0 +1,176 @@
+---
+title: "Statistical Calibration of Species Co-occurrence in CAPTAIN"
+subtitle: "Sub-project 2: HMSC Latent Variable Extraction"
+author: "Earth and Environmental Science, Lund University"
+date: "2026-06-02"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    embed-resources: true
+  pdf:
+    toc: true
+    number-sections: true
+    colorlinks: true
+---
+
+## Introduction and Conceptual Framework
+
+A central problem in ecological modeling is incorporating species co-occurrence patterns observed in empirical datasets into process-based frameworks like CAPTAIN. Joint Species Distribution Models (JSDMs), specifically Hierarchical Modelling of Species Communities (HMSC), separate these patterns into environmental niches (fixed effects) and residual associations (random effects).
+
+The residual variance-covariance matrix $\Omega$ is modeled via latent variables at the sampling-unit level using site scores ($\eta$) and species scores ($\lambda$). The linear predictor vector for site $i$ and species $j$ is formulated as:
+
+$$L_{ij} = L_{ij}^F + L_{ij}^R$$
+
+where $L_{ij}^F$ represents the fixed environmental layout, and the random component is defined as:
+
+$$L_{ij}^R = \sum_{h=1}^{n_f} \eta_{ih} \lambda_{hj}$$
+
+This architecture means that $\Omega = \Lambda^T \Lambda$ serves as a data-driven summary of co-variation, which may capture unmeasured environmental gradients, micro-refugia, or authentic biological interactions such as competitive exclusion.
+
+---
+
+### Step 1: Simulating Community Matrix with Hidden Structuring
+
+We simulate a community composed of two species across 200 spatial patches. Both species respond identically to a single known environmental driver ($x_1$). However, we introduce an unmeasured environmental gradient ($\eta$) to which the species respond with opposite signs, generating an apparent pattern of competitive exclusion in the residuals.
+
+```{r}
+#| label: simulation-setup
+#| message: false
+#| warning: false
+
+set.seed(42)
+n_sites <- 200
+
+# Continuous environmental covariate (Fixed Effect)
+x1 <- rnorm(n_sites)
+XData <- data.frame(x1 = x1)
+X <- cbind(rep(1, n_sites), x1)
+
+# True parameters for the environmental niches (Beta)
+beta <- matrix(c(0.5, 1.2,   # Sp 1
+                 0.5, 1.2),  # Sp 2
+               nrow = 2, byrow = TRUE)
+
+L_fixed <- X %*% t(beta)
+
+# Generate the hidden environmental gradient (True Latent Factor)
+eta_true <- rnorm(n_sites, mean = 0, sd = 1)
+
+# Assign opposing species scores (Lambda) to enforce negative co-occurrence
+lambda_true <- matrix(c(0.1,   # Species 1
+                        0.7), # Species 2
+                      nrow = 2, byrow = TRUE)
+
+L_random <- eta_true %*% t(lambda_true)
+L <- L_fixed + L_random
+
+# Apply probit transformation to obtain binary presence-absence matrix (Y)
+noise <- matrix(rnorm(n_sites * 2), ncol = 2)
+Y <- 1 * ((L + noise) > 0)
+colnames(Y) <- c("sp1", "sp2")
+```
+
+
+```{r}
+#| label: simulation-diagnostics
+colMeans(Y)
+table(Y[, 1], Y[, 2])
+```
+### Step 2: Model Specifications and MCMC Fitting via HMSC
+
+We fit an unstructured sampling-unit level random effect using the Hmsc package. The model is deliberately blind to the second gradient, forcing the variance into the latent parameter layers.
+
+```{r}
+#| label: model-fitting
+#| message: false
+#| warning: false
+#| results: 'hide'
+
+library(Hmsc)
+
+studyDesign <- data.frame(sample = as.factor(1:n_sites))
+rL <- HmscRandomLevel(units = studyDesign$sample)
+XFormula <- ~ x1
+
+model <- Hmsc(Y = Y, XData = XData, XFormula = XFormula,
+              studyDesign = studyDesign, ranLevels = list(sample = rL),
+              distr = "probit")
+
+# Markov Chain Monte Carlo parameter definitions
+thin <- 10
+samples <- 250
+transient <- 500
+nChains <- 2
+
+m_fit <- sampleMcmc(model, thin = thin, samples = samples, 
+                    transient = transient, nChains = nChains, 
+                    verbose = FALSE)
+```
+### Step 3: Extracting Latent Mathematical Layers
+
+To calibrate CAPTAIN, we must systematically extract the mean posterior values for the matrices representing the species responses to unmeasured gradients ($\Lambda$), the hidden site values ($\eta$), and the resulting residual correlation matrix ($\Omega$).
+
+```{r}
+#| label: parameter-extraction
+
+# 3.1 Extract the Residual Correlation Matrix (Omega)
+omega_list <- computeAssociations(m_fit)
+residual_corr <- omega_list[[1]]$mean
+print(residual_corr)
+
+# 3.2 Extract Species Scores (Lambda Matrix)
+lambda_post <- getPostEstimate(m_fit, "Lambda")
+estimated_lambda <- lambda_post$mean
+print(estimated_lambda)
+
+# 3.3 Extract Site Scores (Eta Matrix)
+eta_post <- getPostEstimate(m_fit, "Eta")
+estimated_eta <- eta_post$mean
+head(estimated_eta)
+```
+
+Visualizing the Residual Correlation: We plot the extracted correlation structure to confirm that the model isolated the hidden pattern of negative association between the two simulated species.
+
+```{r}
+#| label: plot-associations
+#| fig-cap: "Estimated residual correlation matrix showing strong negative association."
+library(corrplot)
+corrplot(residual_corr, method = "color", col = c("grey", "white", "black"))
+```
+
+### Step 4: Conditional vs Unconditional Forecasting Configurations
+
+This section demonstrates the difference in predictive capability when conditioning the presence probability of a target species on known data from co-occurring species within the community.
+
+```{r}
+#| label: forecasting-simulations
+
+# 4.1 Unconditional Predictions (Baseline Environmental Projection)
+uncond_list <- predict(m_fit, expected = TRUE)
+uncond_preds <- apply(simplify2array(uncond_list), c(1, 2), mean)
+
+# 4.2 Conditional Predictions (Leveraging the Interspecific Association)
+#partition <- createPartition(m_fit, nfolds = 2, column = "sample")
+partition.sp <- c(1, 2) # Cross-condition species 1 and species 2
+
+cond_list <- computePredictedValues(m_fit, #partition = partition, 
+                                    partition.sp = partition.sp, 
+                                    mcmcStep = 100)
+cond_preds <- apply(simplify2array(cond_list), c(1, 2), mean)
+```
+Analytical Comparison: We format the outputs into a structured frame to track how knowing the state of Species 2 drastically alters the assigned probability of Species 1 relative to the unconditional baseline model.
+
+```{r}
+#| label: output-table
+comparison_df <- data.frame(
+  Observed_Sp1 = Y[, 1],
+  Observed_Sp2 = Y[, 2],
+  Unconditional_Prob_Sp1 = round(uncond_preds[, 1], 3),
+  Conditional_Prob_Sp1 = round(cond_preds[, 1], 3)
+)
+
+head(comparison_df, 15)
+```
+
